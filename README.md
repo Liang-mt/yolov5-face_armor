@@ -58,7 +58,7 @@ yolov5-face2/
 └── transform_labels.py         # 标签格式转换工具
 ```
 
-> 标注 ⭐ 的文件包含核心修改，详见 [MODIFICATION_GUIDE.md](MODIFICATION_GUIDE.md)。
+> 标注 ⭐ 的文件包含核心修改，详见 [MODIFICATION_GUIDE.md](./readme/MODIFICATION_GUIDE.md)。
 
 ---
 
