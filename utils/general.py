@@ -376,13 +376,16 @@ def jaccard_diou(box_a, box_b, iscrowd:bool=False):
     return out if use_batch else out.squeeze(0)
 
 
-def non_max_suppression_face(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, labels=()):
+def non_max_suppression_face(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, labels=(), num_points=4):
     """Performs Non-Maximum Suppression (NMS) on inference results
     Returns:
          detections with shape: nx6 (x1, y1, x2, y2, conf, cls)
     """
     #修改 15改为13
-    nc = prediction.shape[2] - 13  # number of classes
+    #nc = prediction.shape[2] - 13  # number of classes
+    #修改2 用num_points动态计算cls_all和nc
+    cls_all = 5 + num_points * 2  # 关键点坐标结束位置
+    nc = prediction.shape[2] - cls_all  # number of classes
     xc = prediction[..., 4] > conf_thres  # candidates
 
     # Settings
@@ -394,7 +397,10 @@ def non_max_suppression_face(prediction, conf_thres=0.25, iou_thres=0.45, classe
 
     t = time.time()
     #修改 16改为17 目前不知为何
-    output = [torch.zeros((0, 17), device=prediction.device)] * prediction.shape[0]
+    #output = [torch.zeros((0, 17), device=prediction.device)] * prediction.shape[0]
+    #修改2 输出维度动态计算：xyxy(4) + conf(1) + landmarks(num_points*2) + cls_id(1)
+    det_output_size = 5 + num_points * 2 + 1
+    output = [torch.zeros((0, det_output_size), device=prediction.device)] * prediction.shape[0]
     for xi, x in enumerate(prediction):  # image index, image inference
         # Apply constraints
         # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
@@ -404,11 +410,15 @@ def non_max_suppression_face(prediction, conf_thres=0.25, iou_thres=0.45, classe
         if labels and len(labels[xi]):
             l = labels[xi]
             #修改 15改为13
-            v = torch.zeros((len(l), nc + 13), device=x.device)
+            #v = torch.zeros((len(l), nc + 13), device=x.device)
+            #修改2 用cls_all替代硬编码的13
+            v = torch.zeros((len(l), nc + cls_all), device=x.device)
             v[:, :4] = l[:, 1:5]  # box
             v[:, 4] = 1.0  # conf
             #修改 15改为13
-            v[range(len(l)), l[:, 0].long() + 13] = 1.0  # cls
+            #v[range(len(l)), l[:, 0].long() + 13] = 1.0  # cls
+            #修改2 用cls_all替代硬编码的13
+            v[range(len(l)), l[:, 0].long() + cls_all] = 1.0  # cls
             #修改 x的构成为(xyxy, conf, landmarks, cls），所以源代码分别是（4+1+10+1=16）,而改后的代码为（4+1+8+4）=17
             x = torch.cat((x, v), 0)
 
@@ -417,7 +427,9 @@ def non_max_suppression_face(prediction, conf_thres=0.25, iou_thres=0.45, classe
             continue
 
         # Compute conf
-        x[:, 15:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+        #x[:, 15:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+        #修改2 用cls_all替代硬编码的15（修复原代码bug）
+        x[:, cls_all:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
 
         # Box (center x, center y, width, height) to (x1, y1, x2, y2)
         box = xywh2xyxy(x[:, :4])
@@ -425,14 +437,22 @@ def non_max_suppression_face(prediction, conf_thres=0.25, iou_thres=0.45, classe
         # Detections matrix nx6 (xyxy, conf, landmarks, cls)
         if multi_label:
             #修改 15改为13
-            i, j = (x[:, 13:] > conf_thres).nonzero(as_tuple=False).T
+            #i, j = (x[:, 13:] > conf_thres).nonzero(as_tuple=False).T
+            #修改2 用cls_all替代硬编码的13
+            i, j = (x[:, cls_all:] > conf_thres).nonzero(as_tuple=False).T
             #修改 15改为13
-            x = torch.cat((box[i], x[i, j + 13, None], x[i, 5:13] ,j[:, None].float()), 1)
+            #x = torch.cat((box[i], x[i, j + 13, None], x[i, 5:13] ,j[:, None].float()), 1)
+            #修改2 用cls_all替代硬编码的13
+            x = torch.cat((box[i], x[i, j + cls_all, None], x[i, 5:cls_all] ,j[:, None].float()), 1)
         else:  # best class only
             #修改 15改为13
-            conf, j = x[:, 13:].max(1, keepdim=True)
+            #conf, j = x[:, 13:].max(1, keepdim=True)
+            #修改2 用cls_all替代硬编码的13
+            conf, j = x[:, cls_all:].max(1, keepdim=True)
             #修改 15改为13
-            x = torch.cat((box, conf, x[:, 5:13], j.float()), 1)[conf.view(-1) > conf_thres]
+            #x = torch.cat((box, conf, x[:, 5:13], j.float()), 1)[conf.view(-1) > conf_thres]
+            #修改2 用cls_all替代硬编码的13
+            x = torch.cat((box, conf, x[:, 5:cls_all], j.float()), 1)[conf.view(-1) > conf_thres]
             #修改 此时，x变为了xyxy（4）+总置信度（1）+坐标点（8）+类别（1）（这里类别就是单纯的值第几个类别，所以是一维的）
         # Filter by class
         if classes is not None:
@@ -445,7 +465,10 @@ def non_max_suppression_face(prediction, conf_thres=0.25, iou_thres=0.45, classe
 
         # Batched NMS
         #修改 15，16改为13，14
-        c = x[:, 13:14] * (0 if agnostic else max_wh)  # classes
+        #c = x[:, 13:14] * (0 if agnostic else max_wh)  # classes
+        #修改2 class列位置动态计算（NMS输出格式：xyxy(4)+conf(1)+landmarks(N*2)+cls(1)，class在第5+N*2列）
+        lmk_end = 5 + num_points * 2  # xyxy(4) + conf(1) + landmarks(num_points*2)
+        c = x[:, lmk_end:lmk_end+1] * (0 if agnostic else max_wh)  # classes
         boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
         i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
         #if i.shape[0] > max_det:  # limit detections

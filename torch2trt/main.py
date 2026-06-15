@@ -35,7 +35,7 @@ def img_process(img_path,long_side=640,stride_max=32):
         img = img.unsqueeze(0)
     return img,orgimg
 
-def img_vis(img,orgimg,pred,vis_thres = 0.6):
+def img_vis(img,orgimg,pred,vis_thres = 0.6, num_points=4):
     '''
     预测可视化
     vis_thres: 可视化阈值
@@ -44,11 +44,13 @@ def img_vis(img,orgimg,pred,vis_thres = 0.6):
     print('img.shape: ', img.shape)
     print('orgimg.shape: ', orgimg.shape)
 
+    cls_all = 5 + num_points * 2  #修改2 关键点结束位置
     no_vis_nums=0
     # Process detections
     for i, det in enumerate(pred):  # detections per image
         gn = torch.tensor(orgimg.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-        gn_lks = torch.tensor(orgimg.shape)[[1, 0, 1, 0, 1, 0, 1, 0, 1, 0]]  # normalization gain landmarks
+        #修改2 gn_lks动态生成
+        gn_lks = torch.tensor(orgimg.shape)[[1, 0] * num_points]  # normalization gain landmarks
         if len(det):
             # Rescale boxes from img_size to im0 size
             det[:, :4] = scale_coords(img.shape[2:], det[:, :4], orgimg.shape).round()
@@ -57,20 +59,22 @@ def img_vis(img,orgimg,pred,vis_thres = 0.6):
             for c in det[:, -1].unique():
                 n = (det[:, -1] == c).sum()  # detections per class
 
-            det[:, 5:15] = scale_coords_landmarks(img.shape[2:], det[:, 5:15], orgimg.shape).round()
+            #修改2 用cls_all替代硬编码的15
+            det[:, 5:cls_all] = scale_coords_landmarks(img.shape[2:], det[:, 5:cls_all], orgimg.shape).round()
 
             for j in range(det.size()[0]):
-                
-                
+
+
                 if det[j, 4].cpu().numpy() < vis_thres:
                     no_vis_nums+=1
                     continue
 
                 xywh = (xyxy2xywh(det[j, :4].view(1, 4)) / gn).view(-1).tolist()
                 conf = det[j, 4].cpu().numpy()
-                landmarks = (det[j, 5:15].view(1, 10) / gn_lks).view(-1).tolist()
-                class_num = det[j, 15].cpu().numpy()
-                orgimg = show_results(orgimg, xywh, conf, landmarks, class_num)
+                #修改2 用cls_all和num_points替代硬编码的15和10
+                landmarks = (det[j, 5:cls_all].view(1, num_points * 2) / gn_lks).view(-1).tolist()
+                class_num = det[j, cls_all].cpu().numpy()
+                orgimg = show_results(orgimg, xywh, conf, landmarks, class_num, num_points=num_points)
 
     cv2.imwrite(cur_path+'/result.jpg', orgimg)
     print('result save in '+cur_path+'/result.jpg')
@@ -78,21 +82,24 @@ def img_vis(img,orgimg,pred,vis_thres = 0.6):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--img_path', type=str, default=cur_path+"/sample.jpg", help='img path') 
-    parser.add_argument('--trt_path', type=str, required=True, help='trt_path') 
-    parser.add_argument('--output_shape', type=list, default=[1,25200,16], help='input[1,3,640,640] ->  output[1,25200,16]') 
+    parser.add_argument('--img_path', type=str, default=cur_path+"/sample.jpg", help='img path')
+    parser.add_argument('--trt_path', type=str, required=True, help='trt_path')
+    parser.add_argument('--output_shape', type=list, default=[1,25200,16], help='input[1,3,640,640] ->  output[1,25200,16]')
+    #修改2 添加关键点数量参数
+    parser.add_argument('--num_points', type=int, default=4, help='number of keypoints')
     opt = parser.parse_args()
 
 
-    img,orgimg=img_process(opt.img_path) 
+    img,orgimg=img_process(opt.img_path)
     model=TrtModel(opt.trt_path)
     pred=model(img.numpy()).reshape(opt.output_shape) # forward
     model.destroy()
 
     # Apply NMS
-    pred = non_max_suppression_face(torch.from_numpy(pred), conf_thres=0.3, iou_thres=0.5)
-   
+    #修改2 传递num_points给NMS
+    pred = non_max_suppression_face(torch.from_numpy(pred), conf_thres=0.3, iou_thres=0.5, num_points=opt.num_points)
+
     # ============可视化================
-    img_vis(img,orgimg,pred)
+    img_vis(img,orgimg,pred, num_points=opt.num_points)
 
 

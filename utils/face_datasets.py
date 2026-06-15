@@ -56,7 +56,7 @@ def exif_size(img):
     return s
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', num_points=4):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadFaceImagesAndLabels(path, imgsz, batch_size,
@@ -68,6 +68,7 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
+                                      num_points=num_points,
                                     )
 
     batch_size = min(batch_size, len(dataset))
@@ -115,11 +116,14 @@ class _RepeatSampler(object):
 
 class LoadFaceImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1):
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1, num_points=4):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
+        #修改2 存储关键点数量，计算标签列数
+        self.num_points = num_points  # 关键点数量
+        self.cls_all = 5 + num_points * 2  # 标签总列数 = class(1) + bbox(4) + landmarks(num_points*2)
         self.rect = False if image_weights else rect
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
@@ -233,18 +237,24 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
                         l = np.array([x.split() for x in f.read().strip().splitlines()], dtype=np.float32)  # labels
                     if len(l):
                         #修改 15改为13
-                        assert l.shape[1] == 13, 'labels require 15 columns each'
+                        #assert l.shape[1] == 13, 'labels require 15 columns each'
+                        #修改2 用cls_all替代硬编码的13
+                        assert l.shape[1] == self.cls_all, 'labels require %d columns each' % self.cls_all
                         assert (l >= -1).all(), 'negative labels'
                         assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
                         assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
                     else:
                         ne += 1  # label empty
                         #修改 15改为13
-                        l = np.zeros((0, 13), dtype=np.float32)
+                        #l = np.zeros((0, 13), dtype=np.float32)
+                        #修改2 用cls_all替代硬编码的13
+                        l = np.zeros((0, self.cls_all), dtype=np.float32)
                 else:
                     nm += 1  # label missing
                     #修改 15改为13
-                    l = np.zeros((0, 13), dtype=np.float32)
+                    #l = np.zeros((0, 13), dtype=np.float32)
+                    #修改2 用cls_all替代硬编码的13
+                    l = np.zeros((0, self.cls_all), dtype=np.float32)
                 x[im_file] = [l, shape]
             except Exception as e:
                 nc += 1
@@ -309,22 +319,14 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
                 labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
 
                 #labels[:, 5] = ratio[0] * w * x[:, 5] + pad[0]  # pad width
-                labels[:, 5] = np.array(x[:, 5] > 0, dtype=np.int32) * (ratio[0] * w * x[:, 5] + pad[0]) + (
-                    np.array(x[:, 5] > 0, dtype=np.int32) - 1)
-                labels[:, 6] = np.array(x[:, 6] > 0, dtype=np.int32) * (ratio[1] * h * x[:, 6] + pad[1]) + (
-                    np.array(x[:, 6] > 0, dtype=np.int32) - 1)
-                labels[:, 7] = np.array(x[:, 7] > 0, dtype=np.int32) * (ratio[0] * w * x[:, 7] + pad[0]) + (
-                    np.array(x[:, 7] > 0, dtype=np.int32) - 1)
-                labels[:, 8] = np.array(x[:, 8] > 0, dtype=np.int32) * (ratio[1] * h * x[:, 8] + pad[1]) + (
-                    np.array(x[:, 8] > 0, dtype=np.int32) - 1)
-                labels[:, 9] = np.array(x[:, 5] > 0, dtype=np.int32) * (ratio[0] * w * x[:, 9] + pad[0]) + (
-                    np.array(x[:, 9] > 0, dtype=np.int32) - 1)
-                labels[:, 10] = np.array(x[:, 5] > 0, dtype=np.int32) * (ratio[1] * h * x[:, 10] + pad[1]) + (
-                    np.array(x[:, 10] > 0, dtype=np.int32) - 1)
-                labels[:, 11] = np.array(x[:, 11] > 0, dtype=np.int32) * (ratio[0] * w * x[:, 11] + pad[0]) + (
-                    np.array(x[:, 11] > 0, dtype=np.int32) - 1)
-                labels[:, 12] = np.array(x[:, 12] > 0, dtype=np.int32) * (ratio[1] * h * x[:, 12] + pad[1]) + (
-                    np.array(x[:, 12] > 0, dtype=np.int32) - 1)
+                #修改2 用循环处理所有关键点的坐标变换
+                for k in range(self.num_points):
+                    idx_x = 5 + k * 2      # x坐标索引
+                    idx_y = 5 + k * 2 + 1  # y坐标索引
+                    labels[:, idx_x] = np.array(x[:, idx_x] > 0, dtype=np.int32) * (ratio[0] * w * x[:, idx_x] + pad[0]) + (
+                        np.array(x[:, idx_x] > 0, dtype=np.int32) - 1)
+                    labels[:, idx_y] = np.array(x[:, idx_y] > 0, dtype=np.int32) * (ratio[1] * h * x[:, idx_y] + pad[1]) + (
+                        np.array(x[:, idx_y] > 0, dtype=np.int32) - 1)
                 #修改 下面这4行进行注释
                 # labels[:, 13] = np.array(x[:, 13] > 0, dtype=np.int32) * (ratio[0] * w * x[:, 13] + pad[0]) + (
                 #     np.array(x[:, 13] > 0, dtype=np.int32) - 1)
@@ -354,10 +356,13 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
             labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
             labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
             #修改 把下面4行里的13，14删除
-            labels[:, [5, 7, 9, 11]] /= img.shape[1]  # normalized landmark x 0-1
-            labels[:, [5, 7, 9, 11]] = np.where(labels[:, [5, 7, 9, 11]] < 0, -1, labels[:, [5, 7, 9, 11]])
-            labels[:, [6, 8, 10, 12]] /= img.shape[0]  # normalized landmark y 0-1
-            labels[:, [6, 8, 10, 12]] = np.where(labels[:, [6, 8, 10, 12]] < 0, -1, labels[:, [6, 8, 10, 12]])
+            #修改2 用循环处理所有关键点的归一化
+            lmk_x_indices = [5 + k * 2 for k in range(self.num_points)]
+            lmk_y_indices = [5 + k * 2 + 1 for k in range(self.num_points)]
+            labels[:, lmk_x_indices] /= img.shape[1]  # normalized landmark x 0-1
+            labels[:, lmk_x_indices] = np.where(labels[:, lmk_x_indices] < 0, -1, labels[:, lmk_x_indices])
+            labels[:, lmk_y_indices] /= img.shape[0]  # normalized landmark y 0-1
+            labels[:, lmk_y_indices] = np.where(labels[:, lmk_y_indices] < 0, -1, labels[:, lmk_y_indices])
 
         if self.augment:
             # flip up-down
@@ -366,10 +371,10 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
                 if nL:
                     labels[:, 2] = 1 - labels[:, 2]
 
-                    labels[:, 6] = np.where(labels[:,6] < 0, -1, 1 - labels[:, 6])
-                    labels[:, 8] = np.where(labels[:, 8] < 0, -1, 1 - labels[:, 8])
-                    labels[:, 10] = np.where(labels[:, 10] < 0, -1, 1 - labels[:, 10])
-                    labels[:, 12] = np.where(labels[:, 12] < 0, -1, 1 - labels[:, 12])
+                    #修改2 用循环处理所有关键点的上下翻转
+                    for k in range(self.num_points):
+                        idx_y = 5 + k * 2 + 1
+                        labels[:, idx_y] = np.where(labels[:, idx_y] < 0, -1, 1 - labels[:, idx_y])
                     #修改 注释掉下面这行
                     #labels[:, 14] = np.where(labels[:, 14] < 0, -1, 1 - labels[:, 14])
 
@@ -379,10 +384,10 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
 
-                    labels[:, 5] = np.where(labels[:, 5] < 0, -1, 1 - labels[:, 5])
-                    labels[:, 7] = np.where(labels[:, 7] < 0, -1, 1 - labels[:, 7])
-                    labels[:, 9] = np.where(labels[:, 9] < 0, -1, 1 - labels[:, 9])
-                    labels[:, 11] = np.where(labels[:, 11] < 0, -1, 1 - labels[:, 11])
+                    #修改2 用循环处理所有关键点的左右翻转
+                    for k in range(self.num_points):
+                        idx_x = 5 + k * 2
+                        labels[:, idx_x] = np.where(labels[:, idx_x] < 0, -1, 1 - labels[:, idx_x])
                     #修改 注释掉下面这行
                     #labels[:, 13] = np.where(labels[:, 13] < 0, -1, 1 - labels[:, 13])
 
@@ -395,7 +400,9 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
                     # labels[:, [11, 12]] = labels[:, [13, 14]]
                     # labels[:, [13, 14]] = mouth_left
         #修改 16改为14
-        labels_out = torch.zeros((nL, 14))
+        #labels_out = torch.zeros((nL, 14))
+        #修改2 labels_out列数动态计算：img_idx(1) + cls(1) + bbox(4) + landmarks(num_points*2)
+        labels_out = torch.zeros((nL, 1 + self.cls_all))
         if nL:
             labels_out[:, 1:] = torch.from_numpy(labels)
             #showlabels(img, labels[:, 1:5], labels[:, 5:15])
@@ -416,7 +423,7 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
 
 
-def showlabels(img, boxs, landmarks):
+def showlabels(img, boxs, landmarks, num_points=4):
     for box in boxs:
         x,y,w,h = box[0] * img.shape[1], box[1] * img.shape[0], box[2] * img.shape[1], box[3] * img.shape[0]
         #cv2.rectangle(image, (x,y), (x+w,y+h), (0,255,0), 2)
@@ -424,7 +431,8 @@ def showlabels(img, boxs, landmarks):
 
     for landmark in landmarks:
         #cv2.circle(img,(60,60),30,(0,0,255))
-        for i in range(5):
+        #修改2 用num_points替代硬编码的5
+        for i in range(num_points):
             cv2.circle(img, (int(landmark[2*i] * img.shape[1]), int(landmark[2*i+1]*img.shape[0])), 3 ,(0,0,255), -1)
     cv2.imshow('test', img)
     cv2.waitKey(0)
@@ -469,15 +477,12 @@ def load_mosaic_face(self, index):
             labels[:, 3] = w * (x[:, 1] + x[:, 3] / 2) + padw
             labels[:, 4] = h * (x[:, 2] + x[:, 4] / 2) + padh
             #10 landmarks
-
-            labels[:, 5] = np.array(x[:, 5] > 0, dtype=np.int32) * (w * x[:, 5] + padw) + (np.array(x[:, 5] > 0, dtype=np.int32) - 1)
-            labels[:, 6] = np.array(x[:, 6] > 0, dtype=np.int32) * (h * x[:, 6] + padh) + (np.array(x[:, 6] > 0, dtype=np.int32) - 1)
-            labels[:, 7] = np.array(x[:, 7] > 0, dtype=np.int32) * (w * x[:, 7] + padw) + (np.array(x[:, 7] > 0, dtype=np.int32) - 1)
-            labels[:, 8] = np.array(x[:, 8] > 0, dtype=np.int32) * (h * x[:, 8] + padh) + (np.array(x[:, 8] > 0, dtype=np.int32) - 1)
-            labels[:, 9] = np.array(x[:, 9] > 0, dtype=np.int32) * (w * x[:, 9] + padw) + (np.array(x[:, 9] > 0, dtype=np.int32) - 1)
-            labels[:, 10] = np.array(x[:, 10] > 0, dtype=np.int32) * (h * x[:, 10] + padh) + (np.array(x[:, 10] > 0, dtype=np.int32) - 1)
-            labels[:, 11] = np.array(x[:, 11] > 0, dtype=np.int32) * (w * x[:, 11] + padw) + (np.array(x[:, 11] > 0, dtype=np.int32) - 1)
-            labels[:, 12] = np.array(x[:, 12] > 0, dtype=np.int32) * (h * x[:, 12] + padh) + (np.array(x[:, 12] > 0, dtype=np.int32) - 1)
+            #修改2 用循环处理所有关键点的mosaic坐标变换
+            for k in range(self.num_points):
+                idx_x = 5 + k * 2
+                idx_y = 5 + k * 2 + 1
+                labels[:, idx_x] = np.array(x[:, idx_x] > 0, dtype=np.int32) * (w * x[:, idx_x] + padw) + (np.array(x[:, idx_x] > 0, dtype=np.int32) - 1)
+                labels[:, idx_y] = np.array(x[:, idx_y] > 0, dtype=np.int32) * (h * x[:, idx_y] + padh) + (np.array(x[:, idx_y] > 0, dtype=np.int32) - 1)
             #修改 下面两行注释掉
             #labels[:, 13] = np.array(x[:, 13] > 0, dtype=np.int32) * (w * x[:, 13] + padw) + (np.array(x[:, 13] > 0, dtype=np.int32) - 1)
             #labels[:, 14] = np.array(x[:, 14] > 0, dtype=np.int32) * (h * x[:, 14] + padh) + (np.array(x[:, 14] > 0, dtype=np.int32) - 1)
@@ -493,17 +498,12 @@ def load_mosaic_face(self, index):
         labels4[:, 5:] = np.where(labels4[:, 5:] < 0, -1, labels4[:, 5:])
         labels4[:, 5:] = np.where(labels4[:, 5:] > 2 * s, -1, labels4[:, 5:])
 
-        labels4[:, 5] = np.where(labels4[:, 6] == -1, -1, labels4[:, 5])
-        labels4[:, 6] = np.where(labels4[:, 5] == -1, -1, labels4[:, 6])
-
-        labels4[:, 7] = np.where(labels4[:, 8] == -1, -1, labels4[:, 7])
-        labels4[:, 8] = np.where(labels4[:, 7] == -1, -1, labels4[:, 8])
-
-        labels4[:, 9] = np.where(labels4[:, 10] == -1, -1, labels4[:, 9])
-        labels4[:, 10] = np.where(labels4[:, 9] == -1, -1, labels4[:, 10])
-
-        labels4[:, 11] = np.where(labels4[:, 12] == -1, -1, labels4[:, 11])
-        labels4[:, 12] = np.where(labels4[:, 11] == -1, -1, labels4[:, 12])
+        #修改2 用循环处理所有关键点的有效性配对
+        for k in range(self.num_points):
+            idx_x = 5 + k * 2
+            idx_y = 5 + k * 2 + 1
+            labels4[:, idx_x] = np.where(labels4[:, idx_y] == -1, -1, labels4[:, idx_x])
+            labels4[:, idx_y] = np.where(labels4[:, idx_x] == -1, -1, labels4[:, idx_y])
         #修改 下面两行注释
         #labels4[:, 13] = np.where(labels4[:, 14] == -1, -1, labels4[:, 13])
         #labels4[:, 14] = np.where(labels4[:, 13] == -1, -1, labels4[:, 14])
@@ -656,46 +656,62 @@ def random_perspective(img, targets=(), degrees=10, translate=.1, scale=.1, shea
 
     # Transform label coordinates
     n = len(targets)
+    #修改2 获取关键点数量（从targets列数推断）
+    num_pts = (targets.shape[1] - 5) // 2 if n else 4
+    n_pts = num_pts * 2  # 关键点坐标总数
     if n:
         # warp points
         #xy = np.ones((n * 4, 3))
         #修改 9改为8
-        xy = np.ones((n * 8, 3))
+        #xy = np.ones((n * 8, 3))
+        #修改2 变换矩阵行数动态计算：4(边框角点) + num_pts(关键点)
+        n_transform = 4 + num_pts
+        xy = np.ones((n * n_transform, 3))
         #修改 把13，14删除了，9改为8
-        xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2, 5, 6, 7, 8, 9, 10, 11, 12]].reshape(n * 8, 2)  # x1y1, x2y2, x1y2, x2y1
+        #xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2, 5, 6, 7, 8, 9, 10, 11, 12]].reshape(n * 8, 2)  # x1y1, x2y2, x1y2, x2y1
+        #修改2 坐标索引动态生成
+        box_indices = [1, 2, 3, 4, 1, 4, 3, 2]  # 边框4角的xy
+        lmk_indices = []
+        for k in range(num_pts):
+            lmk_indices.extend([5 + k * 2, 5 + k * 2 + 1])
+        all_indices = box_indices + lmk_indices
+        xy[:, :2] = targets[:, all_indices].reshape(n * n_transform, 2)
         xy = xy @ M.T  # transform
         if perspective:
             #修改 18改为16
-            xy = (xy[:, :2] / xy[:, 2:3]).reshape(n, 16)  # rescale
+            #xy = (xy[:, :2] / xy[:, 2:3]).reshape(n, 16)  # rescale
+            #修改2 reshape列数动态计算
+            xy = (xy[:, :2] / xy[:, 2:3]).reshape(n, n_transform * 2)  # rescale
         else:  # affine
             #修改 18改为16
-            xy = xy[:, :2].reshape(n, 16)
+            #xy = xy[:, :2].reshape(n, 16)
+            #修改2 reshape列数动态计算
+            xy = xy[:, :2].reshape(n, n_transform * 2)
 
         # create new boxes
         x = xy[:, [0, 2, 4, 6]]
         y = xy[:, [1, 3, 5, 7]]
         #修改 删除16，17
-        landmarks = xy[:, [8, 9, 10, 11, 12, 13, 14, 15]]
+        #landmarks = xy[:, [8, 9, 10, 11, 12, 13, 14, 15]]
+        #修改2 关键点列索引动态生成
+        lmk_xy_indices = [8 + k for k in range(n_pts)]
+        landmarks = xy[:, lmk_xy_indices]
         mask = np.array(targets[:, 5:] > 0, dtype=np.int32)
         landmarks = landmarks * mask
         landmarks = landmarks + mask - 1
 
         landmarks = np.where(landmarks < 0, -1, landmarks)
         #修改 下面两行把8和9删掉
-        landmarks[:, [0, 2, 4, 6]] = np.where(landmarks[:, [0, 2, 4, 6]] > width, -1, landmarks[:, [0, 2, 4, 6]])
-        landmarks[:, [1, 3, 5, 7]] = np.where(landmarks[:, [1, 3, 5, 7]] > height, -1,landmarks[:, [1, 3, 5, 7]])
+        #修改2 用循环处理所有关键点的边界检查
+        lmk_x_cols = list(range(0, n_pts, 2))
+        lmk_y_cols = list(range(1, n_pts, 2))
+        landmarks[:, lmk_x_cols] = np.where(landmarks[:, lmk_x_cols] > width, -1, landmarks[:, lmk_x_cols])
+        landmarks[:, lmk_y_cols] = np.where(landmarks[:, lmk_y_cols] > height, -1, landmarks[:, lmk_y_cols])
 
-        landmarks[:, 0] = np.where(landmarks[:, 1] == -1, -1, landmarks[:, 0])
-        landmarks[:, 1] = np.where(landmarks[:, 0] == -1, -1, landmarks[:, 1])
-
-        landmarks[:, 2] = np.where(landmarks[:, 3] == -1, -1, landmarks[:, 2])
-        landmarks[:, 3] = np.where(landmarks[:, 2] == -1, -1, landmarks[:, 3])
-
-        landmarks[:, 4] = np.where(landmarks[:, 5] == -1, -1, landmarks[:, 4])
-        landmarks[:, 5] = np.where(landmarks[:, 4] == -1, -1, landmarks[:, 5])
-
-        landmarks[:, 6] = np.where(landmarks[:, 7] == -1, -1, landmarks[:, 6])
-        landmarks[:, 7] = np.where(landmarks[:, 6] == -1, -1, landmarks[:, 7])
+        #修改2 用循环处理所有关键点的配对有效性
+        for k in range(num_pts):
+            landmarks[:, k * 2] = np.where(landmarks[:, k * 2 + 1] == -1, -1, landmarks[:, k * 2])
+            landmarks[:, k * 2 + 1] = np.where(landmarks[:, k * 2] == -1, -1, landmarks[:, k * 2 + 1])
 
         #修改 下面两行注释掉
         #landmarks[:, 8] = np.where(landmarks[:, 9] == -1, -1, landmarks[:, 8])

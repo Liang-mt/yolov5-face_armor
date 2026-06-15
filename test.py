@@ -10,7 +10,7 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from utils.datasets import create_dataloader
+from utils.face_datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, box_iou, \
     non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, non_max_suppression_face
 from utils.loss import compute_loss
@@ -67,10 +67,12 @@ def test(data,
     # Configure
     model.eval()
     is_coco = data.endswith('coco.yaml')  # is COCO dataset
-    with open(data) as f:
+    with open(data, encoding='utf-8') as f:
         data = yaml.load(f, Loader=yaml.FullLoader)  # model dict
     check_dataset(data)  # check
     nc = 1 if single_cls else int(data['nc'])  # number of classes
+    #修改2 从数据配置读取关键点数量
+    num_points = int(data.get('num_points', 4))
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
 
@@ -86,7 +88,7 @@ def test(data,
         img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
         _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
         path = data['test'] if opt.task == 'test' else data['val']  # path to val/test images
-        dataloader = create_dataloader(path, imgsz, batch_size, model.stride.max(), opt, pad=0.5, rect=True)[0]
+        dataloader = create_dataloader(path, imgsz, batch_size, model.stride.max(), opt, pad=0.5, rect=True, num_points=num_points)[0]
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
@@ -118,13 +120,16 @@ def test(data,
             lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
             t = time_synchronized()
             #output = non_max_suppression(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb)
-            output = non_max_suppression_face(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb)
+            output = non_max_suppression_face(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, num_points=num_points)
             t1 += time_synchronized() - t
 
         # Statistics per image
         for si, pred in enumerate(output):
             #修改 15改为13
-            pred = torch.cat((pred[:, :5], pred[:, 13:]), 1) # throw landmark in thresh
+            #pred = torch.cat((pred[:, :5], pred[:, 13:]), 1) # throw landmark in thresh
+            #修改2 用cls_all替代硬编码的13
+            cls_all = 5 + num_points * 2
+            pred = torch.cat((pred[:, :5], pred[:, cls_all:]), 1) # throw landmark in thresh
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class
@@ -167,7 +172,7 @@ def test(data,
                 box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
                 for p, b in zip(pred.tolist(), box.tolist()):
                     jdict.append({'image_id': image_id,
-                                  'category_id': coco91class[int(p[15])] if is_coco else int(p[15]),
+                                  'category_id': coco91class[int(p[5])] if is_coco else int(p[5]),
                                   'bbox': [round(x, 3) for x in b],
                                   'score': round(p[4], 5)})
 

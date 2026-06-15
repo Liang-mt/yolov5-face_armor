@@ -17,5 +17,8 @@ val: ./data/test_data/val
 # number of classes
 nc: 36
 
+# num_points: number of keypoints, customizable (4=armor, 5=face)
+num_points: 4
+
 # class names
 names: ['BG','B1','B2','B3','B4','B5','BO','BBs','BBb','RG','R1','R2','R3','R4','R5','RO','RBs','RBb','NG','N1','N2','N3','N4','N5','NO','NBs','NBb','PG','P1','P2','P3','P4','P5','PO','PBs','PBb']

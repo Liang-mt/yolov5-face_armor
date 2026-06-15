@@ -32,23 +32,19 @@ def scale_coords_landmarks(img1_shape, coords, img0_shape, ratio_pad=None):
         gain = ratio_pad[0][0]
         pad = ratio_pad[1]
 
-    coords[:, [0, 2, 4, 6, 8]] -= pad[0]  # x padding
-    coords[:, [1, 3, 5, 7, 9]] -= pad[1]  # y padding
-    coords[:, :10] /= gain
-    #clip_coords(coords, img0_shape)
-    coords[:, 0].clamp_(0, img0_shape[1])  # x1
-    coords[:, 1].clamp_(0, img0_shape[0])  # y1
-    coords[:, 2].clamp_(0, img0_shape[1])  # x2
-    coords[:, 3].clamp_(0, img0_shape[0])  # y2
-    coords[:, 4].clamp_(0, img0_shape[1])  # x3
-    coords[:, 5].clamp_(0, img0_shape[0])  # y3
-    coords[:, 6].clamp_(0, img0_shape[1])  # x4
-    coords[:, 7].clamp_(0, img0_shape[0])  # y4
-    coords[:, 8].clamp_(0, img0_shape[1])  # x5
-    coords[:, 9].clamp_(0, img0_shape[0])  # y5
+    #修改2 用循环处理所有关键点的padding和缩放
+    num_pts = coords.shape[1] // 2  # 关键点数量
+    x_indices = list(range(0, num_pts * 2, 2))
+    y_indices = list(range(1, num_pts * 2, 2))
+    coords[:, x_indices] -= pad[0]  # x padding
+    coords[:, y_indices] -= pad[1]  # y padding
+    coords[:, :num_pts * 2] /= gain
+    for k in range(num_pts):
+        coords[:, k * 2].clamp_(0, img0_shape[1])      # x
+        coords[:, k * 2 + 1].clamp_(0, img0_shape[0])  # y
     return coords
 
-def show_results(img, xywh, conf, landmarks, class_num):
+def show_results(img, xywh, conf, landmarks, class_num, num_points=4):
     h,w,c = img.shape
     tl = 1 or round(0.002 * (h + w) / 2) + 1  # line/font thickness
     x1 = int(xywh[0] * w - 0.5 * xywh[2] * w)
@@ -59,10 +55,11 @@ def show_results(img, xywh, conf, landmarks, class_num):
 
     clors = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255)]
 
-    for i in range(5):
+    #修改2 用num_points替代硬编码的5
+    for i in range(num_points):
         point_x = int(landmarks[2 * i] * w)
         point_y = int(landmarks[2 * i + 1] * h)
-        cv2.circle(img, (point_x, point_y), tl+1, clors[i], -1)
+        cv2.circle(img, (point_x, point_y), tl+1, clors[i % len(clors)], -1)
 
     tf = max(tl - 1, 1)  # font thickness
     label = str(int(class_num)) + ': ' + str(conf)[:5]
@@ -70,6 +67,8 @@ def show_results(img, xywh, conf, landmarks, class_num):
     return img
 
 def detect(model, img0):
+    #修改2 从模型获取关键点数量
+    num_points = model.model[-1].num_points
     stride = int(model.stride.max())  # model stride
     imgsz = opt.img_size
     if imgsz <= 0:                    # original size    
@@ -88,20 +87,24 @@ def detect(model, img0):
     # Inference
     pred = model(img, augment=opt.augment)[0]
     # Apply NMS
-    pred = non_max_suppression_face(pred, opt.conf_thres, opt.iou_thres)[0]
+    pred = non_max_suppression_face(pred, opt.conf_thres, opt.iou_thres, num_points=num_points)[0]
     gn = torch.tensor(img0.shape)[[1, 0, 1, 0]].to(device)  # normalization gain whwh
-    gn_lks = torch.tensor(img0.shape)[[1, 0, 1, 0, 1, 0, 1, 0, 1, 0]].to(device)  # normalization gain landmarks
+    #修改2 gn_lks动态生成
+    gn_lks = torch.tensor(img0.shape)[[1, 0] * num_points].to(device)  # normalization gain landmarks
+    cls_all = 5 + num_points * 2
     boxes = []
     h, w, c = img0.shape
     if pred is not None:
         pred[:, :4] = scale_coords(img.shape[2:], pred[:, :4], img0.shape).round()
-        pred[:, 5:15] = scale_coords_landmarks(img.shape[2:], pred[:, 5:15], img0.shape).round()
+        #修改2 用cls_all替代硬编码的15
+        pred[:, 5:cls_all] = scale_coords_landmarks(img.shape[2:], pred[:, 5:cls_all], img0.shape).round()
         for j in range(pred.size()[0]):
             xywh = (xyxy2xywh(pred[j, :4].view(1, 4)) / gn).view(-1)
             xywh = xywh.data.cpu().numpy()
             conf = pred[j, 4].cpu().numpy()
-            landmarks = (pred[j, 5:15].view(1, 10) / gn_lks).view(-1).tolist()
-            class_num = pred[j, 15].cpu().numpy()
+            #修改2 用cls_all替代硬编码的15和10
+            landmarks = (pred[j, 5:cls_all].view(1, num_points * 2) / gn_lks).view(-1).tolist()
+            class_num = pred[j, cls_all].cpu().numpy()
             x1 = int(xywh[0] * w - 0.5 * xywh[2] * w)
             y1 = int(xywh[1] * h - 0.5 * xywh[3] * h)
             x2 = int(xywh[0] * w + 0.5 * xywh[2] * w)

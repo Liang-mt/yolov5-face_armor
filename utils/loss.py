@@ -118,6 +118,10 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     lcls, lbox, lobj, lmark = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
     tcls, tbox, indices, anchors, tlandmarks, lmks_mask = build_targets(p, targets, model)  # targets
     h = model.hyp  # hyperparameters
+    #修改2 从模型获取关键点数量，计算cls_all
+    det = model.module.model[-1] if is_parallel(model) else model.model[-1]
+    num_points = det.num_points
+    cls_all = 5 + num_points * 2
 
     # Define criteria
     BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))  # weight=model.class_weights)
@@ -157,11 +161,12 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             tobj[b, a, gj, gi] = (1.0 - model.gr) + model.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
 
             #修改  以下把所有的15改为13
+            #修改2 用cls_all替代硬编码的13
             # Classification
             if model.nc > 1:  # cls loss (only if multiple classes)
-                t = torch.full_like(ps[:, 13:], cn, device=device)  # targets
+                t = torch.full_like(ps[:, cls_all:], cn, device=device)  # targets
                 t[range(n), tcls[i]] = cp
-                lcls += BCEcls(ps[:, 13:], t)  # BCE
+                lcls += BCEcls(ps[:, cls_all:], t)  # BCE
 
             # Append targets to text file
             # with open('targets.txt', 'a') as file:
@@ -170,14 +175,19 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             #landmarks loss
             #plandmarks = ps[:,5:15].sigmoid() * 8. - 4.
             #修改 15改为13
-            plandmarks = ps[:,5:13]
+            #plandmarks = ps[:,5:13]
+            #修改2 用cls_all替代硬编码的13
+            plandmarks = ps[:,5:cls_all]
 
-            plandmarks[:, 0:2] = plandmarks[:, 0:2] * anchors[i]
-            plandmarks[:, 2:4] = plandmarks[:, 2:4] * anchors[i]
-            plandmarks[:, 4:6] = plandmarks[:, 4:6] * anchors[i]
-            plandmarks[:, 6:8] = plandmarks[:, 6:8] * anchors[i]
+            #plandmarks[:, 0:2] = plandmarks[:, 0:2] * anchors[i]
+            #plandmarks[:, 2:4] = plandmarks[:, 2:4] * anchors[i]
+            #plandmarks[:, 4:6] = plandmarks[:, 4:6] * anchors[i]
+            #plandmarks[:, 6:8] = plandmarks[:, 6:8] * anchors[i]
             #修改 下面这行进行注释
             #plandmarks[:, 8:10] = plandmarks[:,8:10] * anchors[i]
+            #修改2 用循环处理所有关键点的anchor缩放
+            for k in range(num_points):
+                plandmarks[:, k*2:k*2+2] = plandmarks[:, k*2:k*2+2] * anchors[i]
 
             lmark += landmarks_loss(plandmarks, tlandmarks[i], lmks_mask[i])
 
@@ -200,10 +210,14 @@ def build_targets(p, targets, model):
     # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
     det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
     na, nt = det.na, targets.shape[0]  # number of anchors, targets
+    #修改2 从模型获取关键点数量
+    num_points = det.num_points
     tcls, tbox, indices, anch, landmarks, lmks_mask = [], [], [], [], [], []
     #gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
     #修改 下面这个17改为15
-    gain = torch.ones(15, device=targets.device)
+    #gain = torch.ones(15, device=targets.device)
+    #修改2 gain大小动态计算：2(cls+img) + 4(xywh) + num_points*2(关键点) + 1(anchor_idx)
+    gain = torch.ones(6 + num_points * 2 + 1, device=targets.device)
     ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
     targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
@@ -218,7 +232,10 @@ def build_targets(p, targets, model):
         gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
         #landmarks 10
         #修改 16改为14，同时后面去掉一个3，2
-        gain[6:14] = torch.tensor(p[i].shape)[[3, 2, 3, 2, 3, 2, 3, 2]]  # xyxy gain
+        #gain[6:14] = torch.tensor(p[i].shape)[[3, 2, 3, 2, 3, 2, 3, 2]]  # xyxy gain
+        #修改2 关键点gain动态生成
+        lmk_gain = torch.tensor(p[i].shape)[[3, 2] * num_points]  # 每个关键点一对(xy)
+        gain[6:6+num_points*2] = lmk_gain
 
         # Match targets to anchors
         t = targets * gain
@@ -250,7 +267,9 @@ def build_targets(p, targets, model):
 
         # Append
         #修改 16改为14
-        a = t[:, 14].long()  # anchor indices
+        #a = t[:, 14].long()  # anchor indices
+        #修改2 anchor索引位置动态计算
+        a = t[:, 6 + num_points * 2].long()  # anchor indices
         #indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
         # 修改为（强制转换+避免原地操作）
         gj_int = torch.clamp(gj.round().long(), 0, int(gain[3] - 1))
@@ -262,19 +281,24 @@ def build_targets(p, targets, model):
 
         #landmarks
         #修改 16改为14
-        lks = t[:,6:14]
+        #lks = t[:,6:14]
+        #修改2 关键点范围动态计算
+        lks = t[:,6:6+num_points*2]
         #lks_mask = lks > 0
         #lks_mask = lks_mask.float()
         lks_mask = torch.where(lks < 0, torch.full_like(lks, 0.), torch.full_like(lks, 1.0))
 
         #应该是关键点的坐标除以anch的宽高才对，便于模型学习。使用gwh会导致不同关键点的编码不同，没有统一的参考标准
 
-        lks[:, [0, 1]] = (lks[:, [0, 1]] - gij)
-        lks[:, [2, 3]] = (lks[:, [2, 3]] - gij)
-        lks[:, [4, 5]] = (lks[:, [4, 5]] - gij)
-        lks[:, [6, 7]] = (lks[:, [6, 7]] - gij)
+        #lks[:, [0, 1]] = (lks[:, [0, 1]] - gij)
+        #lks[:, [2, 3]] = (lks[:, [2, 3]] - gij)
+        #lks[:, [4, 5]] = (lks[:, [4, 5]] - gij)
+        #lks[:, [6, 7]] = (lks[:, [6, 7]] - gij)
         #修改 下面这行注释掉
         #lks[:, [8, 9]] = (lks[:, [8, 9]] - gij)
+        #修改2 用循环处理所有关键点的grid偏移
+        for k in range(num_points):
+            lks[:, [k*2, k*2+1]] = (lks[:, [k*2, k*2+1]] - gij)
 
         '''
         #anch_w = torch.ones(5, device=targets.device).fill_(anchors[0][0])

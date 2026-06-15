@@ -28,12 +28,16 @@ class Detect(nn.Module):
     stride = None  # strides computed during build
     export_cat = False  # onnx export cat output
 
-    def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
+    def __init__(self, nc=80, anchors=(), ch=(), num_points=4):  # detection layer
         super(Detect, self).__init__()
         self.nc = nc  # number of classes
         #self.no = nc + 5  # number of outputs per anchor
         #修改 10改为8
-        self.no = nc + 5 + 8  # number of outputs per anchor
+        #self.no = nc + 5 + 8  # number of outputs per anchor
+        #修改2 将关键点数量参数化，自动计算输出通道数
+        self.num_points = num_points  # 关键点数量
+        self.cls_all = 5 + self.num_points * 2  # 类别通道起始位 = 5(xywh+conf) + num_points*2(关键点坐标)
+        self.no = nc + self.cls_all  # 自动计算输出总通道
 
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
@@ -46,6 +50,11 @@ class Detect(nn.Module):
     def forward(self, x):
         # x = x.copy()  # for profiling
         z = []  # inference output
+        #修改2 兼容旧模型：如果没有cls_all和num_points属性，从no和nc推算
+        if not hasattr(self, 'cls_all'):
+            self.cls_all = self.no - self.nc
+        if not hasattr(self, 'num_points'):
+            self.num_points = (self.cls_all - 5) // 2
         if self.export_cat:
             for i in range(self.nl):
                 x[i] = self.m[i](x[i])  # conv
@@ -58,22 +67,28 @@ class Detect(nn.Module):
 
                 y = torch.full_like(x[i], 0)
                 #修改 15改为13
-                y = y + torch.cat((x[i][:, :, :, :, 0:5].sigmoid(), torch.cat((x[i][:, :, :, :, 5:13], x[i][:, :, :, :, 13:13+self.nc].sigmoid()), 4)), 4)
+                #y = y + torch.cat((x[i][:, :, :, :, 0:5].sigmoid(), torch.cat((x[i][:, :, :, :, 5:13], x[i][:, :, :, :, 13:13+self.nc].sigmoid()), 4)), 4)
+                #修改2 用cls_all替代硬编码的13
+                y = y + torch.cat((x[i][:, :, :, :, 0:5].sigmoid(), torch.cat((x[i][:, :, :, :, 5:self.cls_all], x[i][:, :, :, :, self.cls_all:self.cls_all+self.nc].sigmoid()), 4)), 4)
 
                 box_xy = (y[:, :, :, :, 0:2] * 2. - 0.5 + self.grid[i].to(x[i].device)) * self.stride[i] # xy
                 box_wh = (y[:, :, :, :, 2:4] * 2) ** 2 * self.anchor_grid[i] # wh
                 # box_conf = torch.cat((box_xy, torch.cat((box_wh, y[:, :, :, :, 4:5]), 4)), 4)
 
-                landm1 = y[:, :, :, :, 5:7] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x1 y1
-                landm2 = y[:, :, :, :, 7:9] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x2 y2
-                landm3 = y[:, :, :, :, 9:11] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x3 y3
-                landm4 = y[:, :, :, :, 11:13] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x4 y4
+                #修改2 用循环处理所有关键点的anchor偏移
+                landm_parts = []
+                for k in range(self.num_points):
+                    s = 5 + k * 2
+                    landmk = y[:, :, :, :, s:s+2] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]
+                    landm_parts.append(landmk)
                 #修改 把下面这行注释了
                 #landm5 = y[:, :, :, :, 13:15] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]  # landmark x5 y5
                 # landm = torch.cat((landm1, torch.cat((landm2, torch.cat((landm3, torch.cat((landm4, landm5), 4)), 4)), 4)), 4)
                 # y = torch.cat((box_conf, torch.cat((landm, y[:, :, :, :, 15:15+self.nc]), 4)), 4)
                 #修改 landm5删掉，15改为13
-                y = torch.cat([box_xy, box_wh, y[:, :, :, :, 4:5], landm1, landm2, landm3, landm4, y[:, :, :, :, 13:13+self.nc]], -1)
+                #y = torch.cat([box_xy, box_wh, y[:, :, :, :, 4:5], landm1, landm2, landm3, landm4, y[:, :, :, :, 13:13+self.nc]], -1)
+                #修改2 用动态列表拼接替代硬编码的landm1-4
+                y = torch.cat([box_xy, box_wh, y[:, :, :, :, 4:5]] + landm_parts + [y[:, :, :, :, self.cls_all:self.cls_all+self.nc]], -1)
 
                 z.append(y.view(bs, -1, self.no))
             return torch.cat(z, 1)
@@ -89,28 +104,25 @@ class Detect(nn.Module):
 
                 y = torch.full_like(x[i], 0)
                 #修改 15改为13
-                class_range = list(range(5)) + list(range(13,13+self.nc))
+                #修改2 用cls_all替代硬编码的13
+                class_range = list(range(5)) + list(range(self.cls_all, self.cls_all+self.nc))
                 y[..., class_range] = x[i][..., class_range].sigmoid()
                 #修改 15改为13
-                y[..., 5:13] = x[i][..., 5:13]
+                #y[..., 5:13] = x[i][..., 5:13]
+                #修改2 用cls_all替代硬编码的13
+                y[..., 5:self.cls_all] = x[i][..., 5:self.cls_all]
                 #y = x[i].sigmoid()
 
                 y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i].to(x[i].device)) * self.stride[i]  # xy
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
 
                 #y[..., 5:15] = y[..., 5:15] * 8 - 4
-                y[..., 5:7]   = y[..., 5:7] *   self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i] # landmark x1 y1
-                y[..., 7:9]   = y[..., 7:9] *   self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]# landmark x2 y2
-                y[..., 9:11]  = y[..., 9:11] *  self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]# landmark x3 y3
-                y[..., 11:13] = y[..., 11:13] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]# landmark x4 y4
+                #修改2 用循环处理所有关键点的anchor偏移
+                for k in range(self.num_points):
+                    s = 5 + k * 2
+                    y[..., s:s+2] = y[..., s:s+2] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]
                 #修改 屏蔽下面这一行
                 #y[..., 13:15] = y[..., 13:15] * self.anchor_grid[i] + self.grid[i].to(x[i].device) * self.stride[i]# landmark x5 y5
-
-                #y[..., 5:7] = (y[..., 5:7] * 2 -1) * self.anchor_grid[i]  # landmark x1 y1
-                #y[..., 7:9] = (y[..., 7:9] * 2 -1) * self.anchor_grid[i]  # landmark x2 y2
-                #y[..., 9:11] = (y[..., 9:11] * 2 -1) * self.anchor_grid[i]  # landmark x3 y3
-                #y[..., 11:13] = (y[..., 11:13] * 2 -1) * self.anchor_grid[i]  # landmark x4 y4
-                #y[..., 13:15] = (y[..., 13:15] * 2 -1) * self.anchor_grid[i]  # landmark x5 y5
 
                 z.append(y.view(bs, -1, self.no))
 
@@ -132,8 +144,9 @@ class Detect(nn.Module):
         grid = torch.stack((xv, yv), 2).expand((1, self.na, ny, nx, 2)).float()
         anchor_grid = (self.anchors[i].clone() * self.stride[i]).view((1, self.na, 1, 1, 2)).expand((1, self.na, ny, nx, 2)).float()
         return grid, anchor_grid
+
 class Model(nn.Module):
-    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None):  # model, input channels, number of classes
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, num_points=4):  # model, input channels, number of classes
         super(Model, self).__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
@@ -148,7 +161,8 @@ class Model(nn.Module):
         if nc and nc != self.yaml['nc']:
             logger.info('Overriding model.yaml nc=%g with nc=%g' % (self.yaml['nc'], nc))
             self.yaml['nc'] = nc  # override yaml value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        #修改2 从外部传入num_points，而非从模型yaml读取
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch], num_points=num_points)  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
@@ -266,7 +280,7 @@ class Model(nn.Module):
         model_info(self, verbose, img_size)
 
 
-def parse_model(d, ch):  # model_dict, input_channels(3)
+def parse_model(d, ch, num_points=4):  # model_dict, input_channels(3), num_points
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
@@ -313,6 +327,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = sum([ch[-1 if x == -1 else x + 1] for x in f])
         elif m is Detect:
             args.append([ch[x + 1] for x in f])
+            #修改2 传递num_points给Detect层
+            args.append(num_points)
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
         elif m is MobileNetV3:
